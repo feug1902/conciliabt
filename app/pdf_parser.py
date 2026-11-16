@@ -609,6 +609,66 @@ def parse_free_text(
                 return _finalize_parse_result(t_rows, open_c, close_c, acct_num, num_fmt, text, warnings, "tabla_delimitada")
 
     rows_out: List[dict] = []
+
+    # Strategy: "Según Libros" legacy format where columns are inline:
+    #   Tipo Referencia Descripción Fecha Débitos/Créditos SaldoActual
+    #   (monto y saldo pueden estar en la misma línea o en líneas consecutivas)
+    LIBROS_LINE_RE = re.compile(
+        r"^\s*([A-ZÁÉÍÓÚÑ]{2,6})\s+(\d{6,})\s+(.+?)\s+(\d{2}/\d{2}/\d{4})\s+([\d.,]+)\s*$"
+    )
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        m = LIBROS_LINE_RE.match(line)
+        if m:
+            tipo, ref, desc, fecha_str, monto1_str = m.groups()
+            tx_date = parse_date_str(fecha_str, default_year)
+            if tx_date:
+                # Peek next line for SaldoActual
+                bal_val = None
+                if i + 1 < len(lines):
+                    nxt = lines[i + 1].strip()
+                    m_bal = re.match(r"^([\d.,]+)$", nxt)
+                    if m_bal:
+                        bal_val = parse_amount_to_cents(m_bal.group(1), num_fmt)
+                        i += 1  # consume saldo line
+
+                monto1 = parse_amount_to_cents(monto1_str, num_fmt)
+                if monto1 is not None and monto1 != 0:
+                    # Determine direction: for LIBROS, Débitos=OUT, Créditos=IN.
+                    # Since we only have one monto column visible, infer from sign/amount context.
+                    # If the running balance decreased vs opening, it's OUT; else IN.
+                    direction = infer_direction_from_text(desc, tipo, source)
+                    amount_cents = abs(monto1)
+                    signed = amount_cents if direction == "IN" else -amount_cents
+                    clean_desc = desc or tipo or "Movimiento sin descripción"
+                    rows_out.append({
+                        "tx_date": tx_date,
+                        "reference": ref,
+                        "ref_tail": extract_ref_tail(ref),
+                        "description": clean_desc,
+                        "category": auto_categorize(clean_desc, direction, source),
+                        "direction": direction,
+                        "amount_cents": amount_cents,
+                        "signed_cents": signed,
+                        "running_balance_cents": bal_val,
+                        "_explicit_dir": True,
+                    })
+                i += 1
+                continue
+        i += 1
+
+    # If the libros strategy found rows, use them and skip the standard line parser
+    if rows_out:
+        rows_out, open_cents, inf_close, corr = reconcile_directions_with_balances(rows_out, open_cents)
+        if close_cents is None:
+            close_cents = inf_close
+        if corr:
+            warnings.append(f"Se verificaron {corr} movimientos comparando contra el Saldo acumulado.")
+        return _finalize_parse_result(rows_out, open_cents, close_cents, acct_num, num_fmt, text, warnings, "lineas_libros")
+
+    # Standard line-by-line parser (fallback)
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line or OPEN_BAL_RE.search(line) or CLOSE_BAL_RE.search(line) or SKIP_ROW_PATTERNS.search(line):
